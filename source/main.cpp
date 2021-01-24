@@ -1,43 +1,53 @@
 #include <GarrysMod/Lua/Interface.h>
 #include <lua.hpp>
+
 #include <cstdint>
-#include <sapi.h>
-#include <sphelper.h>
-#include <comdef.h>
 #include <vector>
 #include <locale>
 #include <codecvt>
 #include <string>
 
+#include <comdef.h>
+#include <sapi.h>
+
+#pragma warning(push) // Disable warning C4996: 'GetVersionExA': was declared deprecated (sphelper.h:1319)
+#pragma warning(disable: 4996)
+#include <sphelper.h>
+#pragma warning(pop)
+
 namespace tts
 {
 
-static const char *metaname = "ISpRecognizer";
-static uint8_t metatype = 171;
-static const char *tablename = "speech";
-static const char *invalid_error = "invalid ISpRecognizer";
+static const char metaname[] = "ISpRecognizer";
+static int32_t metatype = -1;
+static const char tablename[] = "speech";
+static const char invalid_error[] = "invalid ISpRecognizer";
 
-struct userdata
+struct Container
 {
 	ISpRecognizer *reco;
-	uint8_t type;
 	ISpRecoContext *context;
 	ISpRecoGrammar *grammar;
 };
 
 inline std::wstring ConvertToUTF16( const char *str )
 {
-	std::wstring_convert< std::codecvt_utf8_utf16<wchar_t> > converter;
-	return converter.from_bytes( str );
+	const int wchars_num = MultiByteToWideChar( CP_UTF8, 0, str, -1, nullptr, 0 );
+	std::wstring wstr( wchars_num - 1, L'\0' );
+	MultiByteToWideChar( CP_UTF8, 0, str, -1, wstr.data( ), wchars_num );
+	return wstr;
 }
 
-inline std::string ConvertToUTF8( const wchar_t *str )
+inline std::string ConvertToUTF8( const wchar_t *wstr )
 {
-	std::wstring_convert< std::codecvt_utf8_utf16<wchar_t> > converter;
-	return converter.to_bytes( str );
+	BOOL used_default_char = false;
+	const int chars_num = WideCharToMultiByte( CP_UTF8, 0, wstr, -1, nullptr, 0, '\0', &used_default_char );
+	std::string str( chars_num - 1, '\0' );
+	WideCharToMultiByte( CP_UTF8, 0, wstr, -1, str.data( ), chars_num, '\0', &used_default_char );
+	return str;
 }
 
-static int32_t PushError( lua_State *state, const char *error, HRESULT hr )
+static int32_t PushError( GarrysMod::Lua::ILuaBase *LUA, const char *error, HRESULT hr )
 {
 	LUA->PushNil( );
 	LUA->PushString( error );
@@ -45,7 +55,7 @@ static int32_t PushError( lua_State *state, const char *error, HRESULT hr )
 	return 3;
 }
 
-inline int32_t PushEvent( lua_State *state, const CSpEvent &ev )
+inline int32_t PushEvent( GarrysMod::Lua::ILuaBase *LUA, const CSpEvent &ev )
 {
 	LUA->CreateTable( );
 
@@ -61,83 +71,82 @@ inline int32_t PushEvent( lua_State *state, const CSpEvent &ev )
 	LUA->PushNumber( static_cast<double>( ev.ullAudioStreamOffset ) );
 	LUA->SetField( -2, "stream_offset" );
 
-	LUA->PushNumber( ev.wParam );
+	LUA->PushNumber( static_cast<double>( ev.wParam ) );
 	LUA->SetField( -2, "wparam" );
 
-	LUA->PushNumber( ev.lParam );
+	LUA->PushNumber(static_cast<double>( ev.lParam ) );
 	LUA->SetField( -2, "lparam" );
 
 	return 1;
 }
 
-inline void Check( lua_State *state, int32_t index )
+inline void Check( GarrysMod::Lua::ILuaBase *LUA, int32_t index )
 {
 	if( !LUA->IsType( index, metatype ) )
-		luaL_typerror( state, index, metaname );
+		luaL_typerror( LUA->GetState( ), index, metaname );
 }
 
-inline userdata *GetUserdata( lua_State *state, int32_t index )
+inline Container *GetUserdata( GarrysMod::Lua::ILuaBase *LUA, int32_t index )
 {
-	return static_cast<userdata *>( LUA->GetUserdata( index ) );
+	return LUA->GetUserType<Container>( index, metatype );
 }
 
-static ISpRecognizer *GetAndValidate( lua_State *state, int32_t index )
+static ISpRecognizer *GetAndValidate( GarrysMod::Lua::ILuaBase *LUA, int32_t index )
 {
-	Check( state, index );
-	ISpRecognizer *reco = GetUserdata( state, index )->reco;
+	Check( LUA, index );
+	ISpRecognizer *reco = GetUserdata( LUA, index )->reco;
 	if( reco == nullptr )
 		LUA->ArgError( index, invalid_error );
 
 	return reco;
 }
 
-static ISpRecoContext *GetContextAndValidate( lua_State *state, int32_t index )
+static ISpRecoContext *GetContextAndValidate( GarrysMod::Lua::ILuaBase *LUA, int32_t index )
 {
-	Check( state, index );
-	ISpRecoContext *context = GetUserdata( state, index )->context;
+	Check( LUA, index );
+	ISpRecoContext *context = GetUserdata( LUA, index )->context;
 	if( context == nullptr )
 		LUA->ArgError( index, invalid_error );
 
 	return context;
 }
 
-static userdata *Create( lua_State *state )
+static Container *Create( GarrysMod::Lua::ILuaBase *LUA )
 {
-	userdata *udata = static_cast<userdata *>( LUA->NewUserdata( sizeof( userdata ) ) );
-	udata->type = metatype;
+	Container *udata = LUA->NewUserType<Container>( metatype );
 	udata->reco = nullptr;
 	udata->context = nullptr;
 	udata->grammar = nullptr;
 
-	LUA->CreateMetaTableType( metaname, metatype );
+	LUA->PushMetaTable( metatype );
 	LUA->SetMetaTable( -2 );
 
 	LUA->CreateTable( );
-	lua_setfenv( state, -2 );
+	lua_setfenv( LUA->GetState( ), -2 );
 
 	return udata;
 }
 
-inline int32_t SetRecognizer( lua_State *state, ISpRecognizer *reco, const char *name )
+inline int32_t SetRecognizer( GarrysMod::Lua::ILuaBase *LUA, ISpRecognizer *reco, const char *name )
 {
-	std::wstring wide = L"Name=" + ConvertToUTF16( name );
+	const std::wstring wide = L"Name=" + ConvertToUTF16( name );
 
 	CComPtr<ISpObjectToken> bestreco;
 	HRESULT hr = SpFindBestToken( SPCAT_RECOGNIZERS, wide.c_str( ), nullptr, &bestreco );
 	if( FAILED( hr ) )
-		return PushError( state, "find_failed", hr );
+		return PushError( LUA, "find_failed", hr );
 
 	hr = reco->SetRecognizer( bestreco );
 	if( FAILED( hr ) )
-		return PushError( state, "change_failed", hr );
+		return PushError( LUA, "change_failed", hr );
 
 	return 0;
 }
 
 LUA_FUNCTION_STATIC( gc )
 {
-	Check( state, 1 );
-	userdata *udata = GetUserdata( state, 1 );
+	Check( LUA, 1 );
+	Container *udata = GetUserdata( LUA, 1 );
 
 	ISpRecoGrammar *grammar = udata->grammar;
 	if( grammar != nullptr )
@@ -165,13 +174,13 @@ LUA_FUNCTION_STATIC( gc )
 
 LUA_FUNCTION_STATIC( tostring )
 {
-	lua_pushfstring( state, "%s: %p", metaname, GetAndValidate( state, 1 ) );
+	lua_pushfstring( LUA->GetState( ), "%s: %p", metaname, GetAndValidate( LUA, 1 ) );
 	return 1;
 }
 
 LUA_FUNCTION_STATIC( eq )
 {
-	LUA->PushBool( GetAndValidate( state, 1 ) == GetAndValidate( state, 2 ) );
+	LUA->PushBool( GetAndValidate( LUA, 1 ) == GetAndValidate( LUA, 2 ) );
 	return 1;
 }
 
@@ -185,7 +194,7 @@ LUA_FUNCTION_STATIC( index )
 
 	LUA->Pop( 2 );
 
-	lua_getfenv( state, 1 );
+	lua_getfenv( LUA->GetState( ), 1 );
 	LUA->Push( 2 );
 	LUA->RawGet( -2 );
 	return 1;
@@ -193,7 +202,7 @@ LUA_FUNCTION_STATIC( index )
 
 LUA_FUNCTION_STATIC( newindex )
 {
-	lua_getfenv( state, 1 );
+	lua_getfenv( LUA->GetState( ), 1 );
 	LUA->Push( 2 );
 	LUA->Push( 3 );
 	LUA->RawSet( -3 );
@@ -202,18 +211,18 @@ LUA_FUNCTION_STATIC( newindex )
 
 LUA_FUNCTION_STATIC( valid )
 {
-	Check( state, 1 );
-	LUA->PushBool( GetUserdata( state, 1 )->reco != nullptr );
+	Check( LUA, 1 );
+	LUA->PushBool( GetUserdata( LUA, 1 )->reco != nullptr );
 	return 1;
 }
 
 LUA_FUNCTION_STATIC( pause )
 {
-	ISpRecoContext *context = GetContextAndValidate( state, 1 );
+	ISpRecoContext *context = GetContextAndValidate( LUA, 1 );
 
 	HRESULT hr = context->Pause( 0 );
 	if( FAILED( hr ) )
-		return PushError( state, "pause_failed", hr );
+		return PushError( LUA, "pause_failed", hr );
 
 	LUA->PushBool( true );
 	return 1;
@@ -221,11 +230,11 @@ LUA_FUNCTION_STATIC( pause )
 
 LUA_FUNCTION_STATIC( resume )
 {
-	ISpRecoContext *context = GetContextAndValidate( state, 1 );
+	ISpRecoContext *context = GetContextAndValidate( LUA, 1 );
 
 	HRESULT hr = context->Resume( 0 );
 	if( FAILED( hr ) )
-		return PushError( state, "resume_failed", hr );
+		return PushError( LUA, "resume_failed", hr );
 
 	LUA->PushBool( true );
 	return 1;
@@ -233,7 +242,7 @@ LUA_FUNCTION_STATIC( resume )
 
 LUA_FUNCTION_STATIC( _state )
 {
-	ISpRecognizer *reco = GetAndValidate( state, 1 );
+	ISpRecognizer *reco = GetAndValidate( LUA, 1 );
 
 	HRESULT hr = S_OK;
 	SPRECOSTATE recostate = SPRST_INACTIVE;
@@ -245,11 +254,11 @@ LUA_FUNCTION_STATIC( _state )
 		else if( std::strcmp( s, "active" ) == 0 )
 			recostate = SPRST_ACTIVE;
 		else
-			return PushError( state, "invalid_state", E_INVALIDARG );
+			return PushError( LUA, "invalid_state", E_INVALIDARG );
 
 		hr = reco->GetRecoState( &recostate );
 		if( FAILED( hr ) )
-			return PushError( state, "state_failed", hr );
+			return PushError( LUA, "state_failed", hr );
 
 		LUA->PushBool( true );
 		return 1;
@@ -257,7 +266,7 @@ LUA_FUNCTION_STATIC( _state )
 
 	hr = reco->GetRecoState( &recostate );
 	if( FAILED( hr ) )
-		return PushError( state, "state_failed", hr );
+		return PushError( LUA, "state_failed", hr );
 
 	switch( recostate )
 	{
@@ -287,7 +296,7 @@ LUA_FUNCTION_STATIC( _state )
 
 LUA_FUNCTION_STATIC( interest )
 {
-	ISpRecoContext *context = GetContextAndValidate( state, 1 );
+	ISpRecoContext *context = GetContextAndValidate( LUA, 1 );
 	ULONGLONG flags = SPFEI( static_cast<ULONGLONG>( LUA->CheckNumber( 2 ) ) );
 
 	int32_t top = LUA->Top( );
@@ -296,7 +305,7 @@ LUA_FUNCTION_STATIC( interest )
 
 	HRESULT hr = context->SetInterest( flags, flags );
 	if( FAILED( hr ) )
-		return PushError( state, "interest_failed", hr );
+		return PushError( LUA, "interest_failed", hr );
 
 	LUA->PushBool( true );
 	return 1;
@@ -304,7 +313,7 @@ LUA_FUNCTION_STATIC( interest )
 
 LUA_FUNCTION_STATIC( events )
 {
-	ISpRecoContext *context = GetContextAndValidate( state, 1 );
+	ISpRecoContext *context = GetContextAndValidate( LUA, 1 );
 	ULONG num = 1;
 
 	if( LUA->Top( ) > 1 )
@@ -313,22 +322,22 @@ LUA_FUNCTION_STATIC( events )
 	std::vector<CSpEvent> events( num );
 	HRESULT hr = context->GetEvents( num, events.data( ), &num );
 	if( FAILED( hr ) )
-		return PushError( state, "retrieval_failed", hr );
+		return PushError( LUA, "retrieval_failed", hr );
 
 	LUA->PushNumber( num );
 
 	if( num == 0 )
 		return 1;
 	else if( num == 1 )
-		PushEvent( state, events[0] );
+		PushEvent( LUA, events[0] );
 	else
 	{
 		LUA->CreateTable( );
 
 		for( ULONG k = 0; k < num; ++k )
 		{
-			LUA->PushNumber( k + 1 );
-			PushEvent( state, events[k] );
+			LUA->PushNumber( static_cast<double>( k + 1 ) );
+			PushEvent( LUA, events[k] );
 			LUA->SetTable( -3 );
 		}
 	}
@@ -338,10 +347,10 @@ LUA_FUNCTION_STATIC( events )
 
 LUA_FUNCTION_STATIC( recognizer )
 {
-	ISpRecognizer *reco = GetAndValidate( state, 1 );
+	ISpRecognizer *reco = GetAndValidate( LUA, 1 );
 	if( LUA->Top( ) > 1 )
 	{
-		int32_t res = SetRecognizer( state, reco, LUA->CheckString( 2 ) );
+		int32_t res = SetRecognizer( LUA, reco, LUA->CheckString( 2 ) );
 		if( res != 0 )
 			return res;
 
@@ -352,12 +361,12 @@ LUA_FUNCTION_STATIC( recognizer )
 	CComPtr<ISpObjectToken> token;
 	HRESULT hr = reco->GetRecognizer( &token );
 	if( FAILED( hr ) )
-		return PushError( state, "retrieval_failed", hr );
+		return PushError( LUA, "retrieval_failed", hr );
 
 	LPWSTR name = nullptr;
 	hr = token->GetStringValue( nullptr, &name );
 	if( FAILED( hr ) )
-		return PushError( state, "name_failed", hr );
+		return PushError( LUA, "name_failed", hr );
 
 	std::string narrow = ConvertToUTF8( name );
 
@@ -371,7 +380,7 @@ LUA_FUNCTION_STATIC( create )
 	if( LUA->Top( ) > 0 )
 		reconame = LUA->CheckString( 1 );
 
-	userdata *udata = Create( state );
+	Container *udata = Create( LUA );
 
 	CComPtr<ISpRecognizer> reco;
 	HRESULT hr = CoCreateInstance(
@@ -382,59 +391,54 @@ LUA_FUNCTION_STATIC( create )
 		reinterpret_cast<void **>( &reco )
 	);
 	if( FAILED( hr ) )
-		return PushError( state, "creation_failed", hr );
+		return PushError( LUA, "creation_failed", hr );
 
 	CComPtr<ISpAudio> audio;
 	hr = SpCreateDefaultObjectFromCategoryId( SPCAT_AUDIOIN, &audio );
 	if( FAILED( hr ) )
-		return PushError( state, "search_failed", hr );
+		return PushError( LUA, "search_failed", hr );
 
 	hr = reco->SetInput( audio, TRUE );
 	if( FAILED( hr ) )
-		return PushError( state, "input_failed", hr );
+		return PushError( LUA, "input_failed", hr );
 
 	CComPtr<ISpRecoContext> context;
 	hr = reco->CreateRecoContext( &context );
 	if( FAILED( hr ) )
-		return PushError( state, "context_failed", hr );
+		return PushError( LUA, "context_failed", hr );
 
 	ULONGLONG interest = SPFEI( SPEI_RECOGNITION );
 	hr = context->SetInterest( interest, interest );
 	if( FAILED( hr ) )
-		return PushError( state, "interest_failed", hr );
+		return PushError( LUA, "interest_failed", hr );
 
 	hr = context->SetNotifyWin32Event( );
 	if( FAILED( hr ) )
-		return PushError( state, "notify_failed", hr );
+		return PushError( LUA, "notify_failed", hr );
 
 	CComPtr<ISpRecoGrammar> grammar;
 	hr = context->CreateGrammar( 0, &grammar );
 	if( FAILED( hr ) )
-		return PushError( state, "grammar_failed", hr );
+		return PushError( LUA, "grammar_failed", hr );
 
-	// TODO
-	// This doesn't work with Microsoft Speech Platform SDK.
-	// Since it's a server utility, it doesn't have grammars by default.
-	// Add more object types like ISpRecoContext and ISpRecoGrammar to allow the developer
-	// to interact with them directly?
-	/*hr = grammar->LoadDictation( nullptr, SPLO_STATIC );
+	hr = grammar->LoadDictation( nullptr, SPLO_STATIC );
 	if( FAILED( hr ) )
-		return PushError( state, "dictation_failed", hr );
+		return PushError( LUA, "dictation_failed", hr );
 
 	hr = grammar->SetDictationState( SPRS_ACTIVE );
 	if( FAILED( hr ) )
-		return PushError( state, "state_failed", hr );*/
+		return PushError( LUA, "state_failed", hr );
 
 	if( reconame != nullptr )
 	{
-		int32_t res = SetRecognizer( state, reco, reconame );
+		int32_t res = SetRecognizer( LUA, reco, reconame );
 		if( res != 0 )
 			return res;
 	}
 
 	hr = reco->SetRecoState( SPRST_ACTIVE );
 	if( FAILED( hr ) )
-		return PushError( state, "activation_failed", hr );
+		return PushError( LUA, "activation_failed", hr );
 
 	udata->reco = reco.Detach( );
 	udata->context = context.Detach( );
@@ -447,12 +451,12 @@ LUA_FUNCTION_STATIC( get_recognizers )
 	CComPtr<IEnumSpObjectTokens> recos;
 	HRESULT hr = SpEnumTokens( SPCAT_RECOGNIZERS, nullptr, nullptr, &recos );
 	if( FAILED( hr ) )
-		return PushError( state, "retrieval_failed", hr );
+		return PushError( LUA, "retrieval_failed", hr );
 
 	ULONG num = 0;
 	hr = recos->GetCount( &num );
 	if( FAILED( hr ) )
-		return PushError( state, "count_failed", hr );
+		return PushError( LUA, "count_failed", hr );
 
 	LUA->CreateTable( );
 
@@ -462,12 +466,12 @@ LUA_FUNCTION_STATIC( get_recognizers )
 		CComPtr<ISpObjectToken> token;
 		hr = recos->Next( 1, &token, nullptr );
 		if( FAILED( hr ) )
-			return PushError( state, "enum_failed", hr );
+			return PushError( LUA, "enum_failed", hr );
 
 		LPWSTR value = nullptr;
 		hr = token->GetStringValue( nullptr, &value );
 		if( FAILED( hr ) )
-			return PushError( state, "identifier_failed", hr );
+			return PushError( LUA, "identifier_failed", hr );
 
 		std::string narrow = ConvertToUTF8( value );
 
@@ -479,12 +483,12 @@ LUA_FUNCTION_STATIC( get_recognizers )
 	return 1;
 }
 
-static void Initialize( lua_State *state )
+static void Initialize( GarrysMod::Lua::ILuaBase *LUA )
 {
 	if( FAILED( CoInitialize( nullptr ) ) )
 		LUA->ThrowError( "failed to initialize COM interfaces" );
 
-	LUA->CreateMetaTableType( metaname, metatype );
+	metatype = LUA->CreateMetaTable( metaname );
 
 	LUA->PushCFunction( gc );
 	LUA->SetField( -2, "__gc" );
@@ -539,7 +543,7 @@ static void Initialize( lua_State *state )
 	LUA->Pop( 1 );
 }
 
-static void Deinitialize( lua_State *state )
+static void Deinitialize( GarrysMod::Lua::ILuaBase *LUA )
 {
 	LUA->PushSpecial( GarrysMod::Lua::SPECIAL_GLOB );
 
@@ -562,12 +566,12 @@ static void Deinitialize( lua_State *state )
 
 GMOD_MODULE_OPEN( )
 {
-	tts::Initialize( state );
+	tts::Initialize( LUA );
 	return 0;
 }
 
 GMOD_MODULE_CLOSE( )
 {
-	tts::Deinitialize( state );
+	tts::Deinitialize( LUA );
 	return 0;
 }

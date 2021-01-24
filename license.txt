@@ -2,7 +2,7 @@ gmcl_speech
 A module for Garry's Mod that provides speech recognition interfaces
 to developers.
 -----------------------------------------------------------------------
-Copyright (c) 2015, Daniel Almeida
+Copyright (c) 2015-2021, Daniel Almeida
 All rights reserved.
 
 Redistribution and use in source and binary forms, with or without
