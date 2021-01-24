@@ -3,23 +3,21 @@
 
 #include <cstdint>
 #include <vector>
-#include <locale>
-#include <codecvt>
 #include <string>
 
 #include <comdef.h>
 #include <sapi.h>
 
-#pragma warning(push) // Disable warning C4996: 'GetVersionExA': was declared deprecated (sphelper.h:1319)
-#pragma warning(disable: 4996)
+#pragma warning( push ) // Disable warning C4996: 'GetVersionExA': was declared deprecated (sphelper.h:1319)
+#pragma warning( disable: 4996 )
 #include <sphelper.h>
-#pragma warning(pop)
+#pragma warning( pop )
 
 namespace tts
 {
 
 static const char metaname[] = "ISpRecognizer";
-static int32_t metatype = -1;
+static int32_t metatype = GarrysMod::Lua::Type::None;
 static const char tablename[] = "speech";
 static const char invalid_error[] = "invalid ISpRecognizer";
 
@@ -74,7 +72,7 @@ inline int32_t PushEvent( GarrysMod::Lua::ILuaBase *LUA, const CSpEvent &ev )
 	LUA->PushNumber( static_cast<double>( ev.wParam ) );
 	LUA->SetField( -2, "wparam" );
 
-	LUA->PushNumber(static_cast<double>( ev.lParam ) );
+	LUA->PushNumber( static_cast<double>( ev.lParam ) );
 	LUA->SetField( -2, "lparam" );
 
 	return 1;
