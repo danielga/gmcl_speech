@@ -1,15 +1,20 @@
 #include <GarrysMod/Lua/Interface.h>
+#include <GarrysMod/FactoryLoader.hpp>
 #include <lua.hpp>
 
 #include <cstdint>
 #include <vector>
 #include <string>
 
+#include <filesystem.h>
+
 #include <comdef.h>
 #include <sapi.h>
 
-#pragma warning( push ) // Disable warning C4996: 'GetVersionExA': was declared deprecated (sphelper.h:1319)
-#pragma warning( disable: 4996 )
+#pragma warning( push )
+// Disable warning C4996: 'GetVersionExA': was declared deprecated (sphelper.h:1319)
+// Disable warning 4805: '==': unsafe mix of type 'BOOL' and type 'bool' in operation (sphelper.h:1319)
+#pragma warning( disable: 4996 4805 )
 #include <sphelper.h>
 #pragma warning( pop )
 
@@ -21,11 +26,14 @@ static int32_t metatype = GarrysMod::Lua::Type::None;
 static const char tablename[] = "speech";
 static const char invalid_error[] = "invalid ISpRecognizer";
 
+static SourceSDK::FactoryLoader filesystem_loader( "filesystem_stdio" );
+static IFileSystem *filesystem = nullptr;
+
 struct Container
 {
-	ISpRecognizer *reco;
-	ISpRecoContext *context;
-	ISpRecoGrammar *grammar;
+	CComPtr<ISpRecognizer> reco;
+	CComPtr<ISpRecoContext> context;
+	CComPtr<ISpRecoGrammar> grammar;
 };
 
 inline std::wstring ConvertToUTF16( const char *str )
@@ -43,6 +51,21 @@ inline std::string ConvertToUTF8( const wchar_t *wstr )
 	std::string str( chars_num - 1, '\0' );
 	WideCharToMultiByte( CP_UTF8, 0, wstr, -1, str.data( ), chars_num, '\0', &used_default_char );
 	return str;
+}
+
+template<size_t maxLenInChars> inline int ValidateAndFixPathName( GarrysMod::Lua::ILuaBase *LUA, const char *path, char (&fullpath)[maxLenInChars] )
+{
+	char tmpfixedpath[2048] = { 0 };
+	V_FixupPathName( tmpfixedpath, sizeof( tmpfixedpath ), path );
+	const std::string fixedpath = tmpfixedpath;
+
+	if( V_IsAbsolutePath( fixedpath.c_str( ) ) || fixedpath == ".." || fixedpath.find( ".." CORRECT_PATH_SEPARATOR_S ) != fixedpath.npos )
+		return PushError( LUA, "invalid_path", 0 );
+
+	if( !filesystem->RelativePathToFullPath_safe( fixedpath.c_str( ), "DATA", fullpath ) )
+		return PushError( LUA, "path_failed", 0 );
+
+	return 0;
 }
 
 static int32_t PushError( GarrysMod::Lua::ILuaBase *LUA, const char *error, HRESULT hr )
@@ -74,6 +97,26 @@ inline int32_t PushEvent( GarrysMod::Lua::ILuaBase *LUA, const CSpEvent &ev )
 
 	LUA->PushNumber( static_cast<double>( ev.lParam ) );
 	LUA->SetField( -2, "lparam" );
+
+	if( ev.eEventId == SPEI_RECOGNITION )
+	{
+		auto result = reinterpret_cast<ISpRecoResult *>( ev.lParam );
+		WCHAR *pwszText = nullptr;
+		HRESULT hr = result->GetText( static_cast<ULONG>( SP_GETWHOLEPHRASE ), static_cast<ULONG>( SP_GETWHOLEPHRASE ), TRUE, &pwszText, nullptr );
+		if( SUCCEEDED( hr ) )
+		{
+			const auto text = ConvertToUTF8( pwszText );
+			CoTaskMemFree( pwszText );
+
+			LUA->PushString( text.c_str( ) );
+			LUA->SetField( -2, "text" );
+		}
+		else
+		{
+			LUA->PushString( "<failure>" );
+			LUA->SetField( -2, "text" );
+		}
+	}
 
 	return 1;
 }
@@ -109,12 +152,19 @@ static ISpRecoContext *GetContextAndValidate( GarrysMod::Lua::ILuaBase *LUA, int
 	return context;
 }
 
+static ISpRecoGrammar *GetGrammarAndValidate( GarrysMod::Lua::ILuaBase *LUA, int32_t index )
+{
+	Check( LUA, index );
+	ISpRecoGrammar *grammar = GetUserdata( LUA, index )->grammar;
+	if( grammar == nullptr )
+		LUA->ArgError( index, invalid_error );
+
+	return grammar;
+}
+
 static Container *Create( GarrysMod::Lua::ILuaBase *LUA )
 {
 	Container *udata = LUA->NewUserType<Container>( metatype );
-	udata->reco = nullptr;
-	udata->context = nullptr;
-	udata->grammar = nullptr;
 
 	LUA->PushMetaTable( metatype );
 	LUA->SetMetaTable( -2 );
@@ -125,16 +175,16 @@ static Container *Create( GarrysMod::Lua::ILuaBase *LUA )
 	return udata;
 }
 
-inline int32_t SetRecognizer( GarrysMod::Lua::ILuaBase *LUA, ISpRecognizer *reco, const char *name )
+inline int32_t SetRecognizer( GarrysMod::Lua::ILuaBase *LUA, ISpRecognizer *reco, const char *id )
 {
-	const std::wstring wide = L"Name=" + ConvertToUTF16( name );
+	const auto wId = ConvertToUTF16( id );
 
-	CComPtr<ISpObjectToken> bestreco;
-	HRESULT hr = SpFindBestToken( SPCAT_RECOGNIZERS, wide.c_str( ), nullptr, &bestreco );
+	CComPtr<ISpObjectToken> recotoken;
+	HRESULT hr = SpGetTokenFromId( wId.c_str( ), &recotoken );
 	if( FAILED( hr ) )
 		return PushError( LUA, "find_failed", hr );
 
-	hr = reco->SetRecognizer( bestreco );
+	hr = reco->SetRecognizer( recotoken );
 	if( FAILED( hr ) )
 		return PushError( LUA, "change_failed", hr );
 
@@ -146,26 +196,9 @@ LUA_FUNCTION_STATIC( gc )
 	Check( LUA, 1 );
 	Container *udata = GetUserdata( LUA, 1 );
 
-	ISpRecoGrammar *grammar = udata->grammar;
-	if( grammar != nullptr )
-	{
-		grammar->Release( );
-		udata->grammar = nullptr;
-	}
-
-	ISpRecoContext *context = udata->context;
-	if( context != nullptr )
-	{
-		context->Release( );
-		udata->context = nullptr;
-	}
-
-	ISpRecognizer *reco = udata->reco;
-	if( reco != nullptr )
-	{
-		reco->Release( );
-		udata->reco = nullptr;
-	}
+	udata->grammar.Release( );
+	udata->context.Release( );
+	udata->reco.Release( );
 
 	return 0;
 }
@@ -216,7 +249,7 @@ LUA_FUNCTION_STATIC( valid )
 
 LUA_FUNCTION_STATIC( pause )
 {
-	ISpRecoContext *context = GetContextAndValidate( LUA, 1 );
+	auto context = GetContextAndValidate( LUA, 1 );
 
 	HRESULT hr = context->Pause( 0 );
 	if( FAILED( hr ) )
@@ -228,7 +261,7 @@ LUA_FUNCTION_STATIC( pause )
 
 LUA_FUNCTION_STATIC( resume )
 {
-	ISpRecoContext *context = GetContextAndValidate( LUA, 1 );
+	auto context = GetContextAndValidate( LUA, 1 );
 
 	HRESULT hr = context->Resume( 0 );
 	if( FAILED( hr ) )
@@ -238,11 +271,10 @@ LUA_FUNCTION_STATIC( resume )
 	return 1;
 }
 
-LUA_FUNCTION_STATIC( _state )
+LUA_FUNCTION_STATIC( reco_state )
 {
-	ISpRecognizer *reco = GetAndValidate( LUA, 1 );
+	auto reco = GetAndValidate( LUA, 1 );
 
-	HRESULT hr = S_OK;
 	SPRECOSTATE recostate = SPRST_INACTIVE;
 	if( LUA->Top( ) > 1 )
 	{
@@ -251,10 +283,14 @@ LUA_FUNCTION_STATIC( _state )
 			recostate = SPRST_INACTIVE;
 		else if( std::strcmp( s, "active" ) == 0 )
 			recostate = SPRST_ACTIVE;
+		else if( std::strcmp( s, "active_always" ) == 0 )
+			recostate = SPRST_ACTIVE_ALWAYS;
+		else if( std::strcmp( s, "inactive_with_purge" ) == 0 )
+			recostate = SPRST_INACTIVE_WITH_PURGE;
 		else
 			return PushError( LUA, "invalid_state", E_INVALIDARG );
 
-		hr = reco->GetRecoState( &recostate );
+		HRESULT hr = reco->SetRecoState( recostate );
 		if( FAILED( hr ) )
 			return PushError( LUA, "state_failed", hr );
 
@@ -262,7 +298,7 @@ LUA_FUNCTION_STATIC( _state )
 		return 1;
 	}
 
-	hr = reco->GetRecoState( &recostate );
+	HRESULT hr = reco->GetRecoState( &recostate );
 	if( FAILED( hr ) )
 		return PushError( LUA, "state_failed", hr );
 
@@ -281,7 +317,83 @@ LUA_FUNCTION_STATIC( _state )
 			break;
 
 		case SPRST_INACTIVE_WITH_PURGE:
-			LUA->PushString( "inactive_purge" );
+			LUA->PushString( "inactive_with_purge" );
+			break;
+
+		default:
+			LUA->PushString( "unknown" );
+			break;
+	}
+
+	return 1;
+}
+
+LUA_FUNCTION_STATIC( dictation_state )
+{
+	auto grammar = GetGrammarAndValidate( LUA, 1 );
+
+	SPRULESTATE dictationstate = SPRS_INACTIVE;
+	const char *s = LUA->CheckString( 2 );
+	if( std::strcmp( s, "inactive" ) == 0 )
+		dictationstate = SPRS_INACTIVE;
+	else if( std::strcmp( s, "active" ) == 0 )
+		dictationstate = SPRS_ACTIVE;
+	else if( std::strcmp( s, "active_with_autopause" ) == 0 )
+		dictationstate = SPRS_ACTIVE_WITH_AUTO_PAUSE;
+	else if( std::strcmp( s, "active_user_delimited" ) == 0 )
+		dictationstate = SPRS_ACTIVE_USER_DELIMITED;
+	else
+		return PushError( LUA, "invalid_state", E_INVALIDARG );
+
+	HRESULT hr = grammar->SetDictationState( dictationstate );
+	if( FAILED( hr ) )
+		return PushError( LUA, "state_failed", hr );
+
+	LUA->PushBool( true );
+	return 1;
+}
+
+LUA_FUNCTION_STATIC( grammar_state )
+{
+	auto grammar = GetGrammarAndValidate( LUA, 1 );
+
+	SPGRAMMARSTATE grammarstate = SPGS_DISABLED;
+	if( LUA->Top( ) > 1 )
+	{
+		const char *s = LUA->CheckString( 2 );
+		if( std::strcmp( s, "disabled" ) == 0 )
+			grammarstate = SPGS_DISABLED;
+		else if( std::strcmp( s, "enabled" ) == 0 )
+			grammarstate = SPGS_ENABLED;
+		else if( std::strcmp( s, "exclusive" ) == 0 )
+			grammarstate = SPGS_EXCLUSIVE;
+		else
+			return PushError( LUA, "invalid_state", E_INVALIDARG );
+
+		HRESULT hr = grammar->SetGrammarState( grammarstate );
+		if( FAILED( hr ) )
+			return PushError( LUA, "state_failed", hr );
+
+		LUA->PushBool( true );
+		return 1;
+	}
+
+	HRESULT hr = grammar->GetGrammarState( &grammarstate );
+	if( FAILED( hr ) )
+		return PushError( LUA, "state_failed", hr );
+
+	switch( grammarstate )
+	{
+		case SPGS_DISABLED:
+			LUA->PushString( "disabled" );
+			break;
+
+		case SPGS_ENABLED:
+			LUA->PushString( "enabled" );
+			break;
+
+		case SPGS_EXCLUSIVE:
+			LUA->PushString( "exclusive" );
 			break;
 
 		default:
@@ -311,14 +423,15 @@ LUA_FUNCTION_STATIC( interest )
 
 LUA_FUNCTION_STATIC( events )
 {
-	ISpRecoContext *context = GetContextAndValidate( LUA, 1 );
-	ULONG num = 1;
+	auto context = GetContextAndValidate( LUA, 1 );
+	ULONG req = 1;
 
 	if( LUA->Top( ) > 1 )
-		num = static_cast<ULONG>( LUA->CheckNumber( 2 ) );
+		req = static_cast<ULONG>( LUA->CheckNumber( 2 ) );
 
-	std::vector<CSpEvent> events( num );
-	HRESULT hr = context->GetEvents( num, events.data( ), &num );
+	std::vector<CSpEvent> events( req );
+	ULONG num = 0;
+	HRESULT hr = context->GetEvents( req, events.data( ), &num );
 	if( FAILED( hr ) )
 		return PushError( LUA, "retrieval_failed", hr );
 
@@ -326,18 +439,20 @@ LUA_FUNCTION_STATIC( events )
 
 	if( num == 0 )
 		return 1;
-	else if( num == 1 )
-		PushEvent( LUA, events[0] );
-	else
-	{
-		LUA->CreateTable( );
 
-		for( ULONG k = 0; k < num; ++k )
-		{
-			LUA->PushNumber( static_cast<double>( k + 1 ) );
-			PushEvent( LUA, events[k] );
-			LUA->SetTable( -3 );
-		}
+	if( req == 1 && num == 1 )
+	{
+		PushEvent( LUA, events[0] );
+		return 1;
+	}
+
+	LUA->CreateTable( );
+
+	for( ULONG k = 0; k < num; ++k )
+	{
+		LUA->PushNumber( static_cast<double>( k + 1 ) );
+		PushEvent( LUA, events[k] );
+		LUA->SetTable( -3 );
 	}
 
 	return 2;
@@ -345,7 +460,7 @@ LUA_FUNCTION_STATIC( events )
 
 LUA_FUNCTION_STATIC( recognizer )
 {
-	ISpRecognizer *reco = GetAndValidate( LUA, 1 );
+	auto reco = GetAndValidate( LUA, 1 );
 	if( LUA->Top( ) > 1 )
 	{
 		int32_t res = SetRecognizer( LUA, reco, LUA->CheckString( 2 ) );
@@ -366,17 +481,91 @@ LUA_FUNCTION_STATIC( recognizer )
 	if( FAILED( hr ) )
 		return PushError( LUA, "name_failed", hr );
 
-	std::string narrow = ConvertToUTF8( name );
-
+	const auto narrow = ConvertToUTF8( name );
 	LUA->PushString( narrow.c_str( ) );
+	return 1;
+}
+
+LUA_FUNCTION_STATIC( grammar )
+{
+	auto grammar = GetGrammarAndValidate( LUA, 1 );
+	auto path = LUA->CheckString( 2 );
+
+	char fullpath[2048] = { 0 };
+	const int res = ValidateAndFixPathName( LUA, path, fullpath );
+	if( res != 0 )
+		return res;
+
+	const auto wPath = ConvertToUTF16( fullpath );
+	HRESULT hr = grammar->LoadCmdFromFile( wPath.c_str( ), SPLO_STATIC );
+	if( FAILED( hr ) )
+		return PushError( LUA, "load_failed", hr );
+
+	LUA->PushBool( true );
+	return 1;
+}
+
+LUA_FUNCTION_STATIC( load_dictation )
+{
+	auto grammar = GetGrammarAndValidate( LUA, 1 );
+
+	HRESULT hr = grammar->LoadDictation( nullptr, SPLO_STATIC );
+	if( FAILED( hr ) )
+		return PushError( LUA, "load_failed", hr );
+
+	LUA->PushBool( true );
+	return 1;
+}
+
+LUA_FUNCTION_STATIC( unload_dictation )
+{
+	auto grammar = GetGrammarAndValidate( LUA, 1 );
+
+	HRESULT hr = grammar->UnloadDictation( );
+	if( FAILED( hr ) )
+		return PushError( LUA, "unload_failed", hr );
+
+	LUA->PushBool( true );
+	return 1;
+}
+
+LUA_FUNCTION_STATIC( rule_state )
+{
+	auto grammar = GetGrammarAndValidate( LUA, 1 );
+
+	std::wstring wName;
+	if( LUA->IsType( 2, GarrysMod::Lua::Type::STRING ) )
+	{
+		const char *name = LUA->CheckString( 2 );
+		wName = ConvertToUTF16( name );
+	}
+
+	SPRULESTATE rulestate = SPRS_INACTIVE;
+	const char *s = LUA->CheckString( 3 );
+	if( std::strcmp( s, "inactive" ) == 0 )
+		rulestate = SPRS_INACTIVE;
+	else if( std::strcmp( s, "active" ) == 0 )
+		rulestate = SPRS_ACTIVE;
+	else if( std::strcmp( s, "active_with_autopause" ) == 0 )
+		rulestate = SPRS_ACTIVE_WITH_AUTO_PAUSE;
+	else if( std::strcmp( s, "active_user_delimited" ) == 0 )
+		rulestate = SPRS_ACTIVE_USER_DELIMITED;
+	else
+		return PushError( LUA, "invalid_state", E_INVALIDARG );
+
+	HRESULT hr = grammar->SetRuleState( wName.empty( ) ? nullptr : wName.c_str( ), nullptr, rulestate);
+	if( FAILED( hr ) )
+		return PushError( LUA, "state_failed", hr );
+
+	LUA->PushBool( true );
 	return 1;
 }
 
 LUA_FUNCTION_STATIC( create )
 {
-	const char *reconame = nullptr;
+	const char *recoid = nullptr;
 	if( LUA->Top( ) > 0 )
-		reconame = LUA->CheckString( 1 );
+		recoid = LUA->CheckString( 1 );
 
 	Container *udata = Create( LUA );
 
@@ -405,11 +594,6 @@ LUA_FUNCTION_STATIC( create )
 	if( FAILED( hr ) )
 		return PushError( LUA, "context_failed", hr );
 
-	ULONGLONG interest = SPFEI( SPEI_RECOGNITION );
-	hr = context->SetInterest( interest, interest );
-	if( FAILED( hr ) )
-		return PushError( LUA, "interest_failed", hr );
-
 	hr = context->SetNotifyWin32Event( );
 	if( FAILED( hr ) )
 		return PushError( LUA, "notify_failed", hr );
@@ -419,28 +603,16 @@ LUA_FUNCTION_STATIC( create )
 	if( FAILED( hr ) )
 		return PushError( LUA, "grammar_failed", hr );
 
-	hr = grammar->LoadDictation( nullptr, SPLO_STATIC );
-	if( FAILED( hr ) )
-		return PushError( LUA, "dictation_failed", hr );
-
-	hr = grammar->SetDictationState( SPRS_ACTIVE );
-	if( FAILED( hr ) )
-		return PushError( LUA, "state_failed", hr );
-
-	if( reconame != nullptr )
+	if( recoid != nullptr )
 	{
-		int32_t res = SetRecognizer( LUA, reco, reconame );
+		int32_t res = SetRecognizer( LUA, reco, recoid );
 		if( res != 0 )
 			return res;
 	}
 
-	hr = reco->SetRecoState( SPRST_ACTIVE );
-	if( FAILED( hr ) )
-		return PushError( LUA, "activation_failed", hr );
-
-	udata->reco = reco.Detach( );
-	udata->context = context.Detach( );
-	udata->grammar = grammar.Detach( );
+	udata->reco = std::move( reco );
+	udata->context = std::move( context );
+	udata->grammar = std::move( grammar );
 	return 1;
 }
 
@@ -466,15 +638,31 @@ LUA_FUNCTION_STATIC( get_recognizers )
 		if( FAILED( hr ) )
 			return PushError( LUA, "enum_failed", hr );
 
-		LPWSTR value = nullptr;
-		hr = token->GetStringValue( nullptr, &value );
+		LPWSTR wId = nullptr;
+		hr = token->GetId( &wId );
 		if( FAILED( hr ) )
 			return PushError( LUA, "identifier_failed", hr );
 
-		std::string narrow = ConvertToUTF8( value );
+		const auto id = ConvertToUTF8( wId );
+		CoTaskMemFree( wId );
+
+		LPWSTR wName = nullptr;
+		hr = token->GetStringValue( nullptr, &wName );
+		if( FAILED( hr ) )
+			return PushError( LUA, "name_failed", hr );
+
+		const auto name = ConvertToUTF8( wName );
 
 		LUA->PushNumber( ++idx );
-		LUA->PushString( narrow.c_str( ) );
+
+		LUA->CreateTable( );
+
+		LUA->PushString( id.c_str( ) );
+		LUA->SetField( -2, "id" );
+
+		LUA->PushString( name.c_str( ) );
+		LUA->SetField( -2, "name" );
+
 		LUA->SetTable( -3 );
 	}
 
@@ -485,6 +673,10 @@ static void Initialize( GarrysMod::Lua::ILuaBase *LUA )
 {
 	if( FAILED( CoInitialize( nullptr ) ) )
 		LUA->ThrowError( "failed to initialize COM interfaces" );
+
+	filesystem = filesystem_loader.GetInterface<IFileSystem>( FILESYSTEM_INTERFACE_VERSION );
+	if( filesystem == nullptr )
+		LUA->ThrowError( "unable to initialize IFileSystem" );
 
 	metatype = LUA->CreateMetaTable( metaname );
 
@@ -512,8 +704,17 @@ static void Initialize( GarrysMod::Lua::ILuaBase *LUA )
 	LUA->PushCFunction( resume );
 	LUA->SetField( -2, "resume" );
 
-	LUA->PushCFunction( _state );
-	LUA->SetField( -2, "state" );
+	LUA->PushCFunction( reco_state );
+	LUA->SetField( -2, "reco_state" );
+
+	LUA->PushCFunction( grammar_state );
+	LUA->SetField( -2, "grammar_state" );
+
+	LUA->PushCFunction( dictation_state );
+	LUA->SetField( -2, "dictation_state" );
+
+	LUA->PushCFunction( rule_state );
+	LUA->SetField( -2, "rule_state" );
 
 	LUA->PushCFunction( interest );
 	LUA->SetField( -2, "interest" );
@@ -523,6 +724,15 @@ static void Initialize( GarrysMod::Lua::ILuaBase *LUA )
 
 	LUA->PushCFunction( recognizer );
 	LUA->SetField( -2, "recognizer" );
+
+	LUA->PushCFunction( grammar );
+	LUA->SetField( -2, "grammar" );
+
+	LUA->PushCFunction( load_dictation );
+	LUA->SetField( -2, "load_dictation" );
+
+	LUA->PushCFunction( unload_dictation );
+	LUA->SetField( -2, "unload_dictation" );
 
 	LUA->Pop( 1 );
 

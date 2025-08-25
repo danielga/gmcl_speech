@@ -1,0 +1,32 @@
+<grammar langid="409">
+  <rule name="arcane attacks" toplevel="active">
+    <o>...</o>
+    <list>
+      <phrase>fireball</phrase>
+      <phrase>flame wave</phrase>
+      <phrase>frost nova</phrase>
+      <phrase>teleport</phrase>
+      <phrase>arcane barrier</phrase>
+      <phrase>arcane missiles</phrase>
+      <phrase>arcane spear</phrase>
+      <phrase>blackhole</phrase>
+      <phrase>fireball</phrase>
+      <phrase>flame wave</phrase>
+      <phrase>frost nova</phrase>
+      <phrase>healing</phrase>
+      <phrase>lightning orb</phrase>
+      <phrase>lightning strike</phrase>
+      <phrase>minify player</phrase>
+      <phrase>poison cloud</phrase>
+      <phrase>regeneration</phrase>
+      <phrase>ritual of blood</phrase>
+      <phrase>ritual of day</phrase>
+      <phrase>ritual of night</phrase>
+      <phrase>ritual of thunder</phrase>
+      <phrase>stone volley</phrase>
+      <phrase>wind dash</phrase>
+      <phrase>wind sweep</phrase>
+    </list>
+    <o>...</o>
+  </rule>
+</grammar>
