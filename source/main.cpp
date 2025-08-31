@@ -101,7 +101,7 @@ inline int32_t PushEvent( GarrysMod::Lua::ILuaBase *LUA, const CSpEvent &ev )
 	if( ev.eEventId == SPEI_RECOGNITION )
 	{
 		auto result = reinterpret_cast<ISpRecoResult *>( ev.lParam );
-		WCHAR *pwszText = nullptr;
+		LPWSTR pwszText = nullptr;
 		HRESULT hr = result->GetText( static_cast<ULONG>( SP_GETWHOLEPHRASE ), static_cast<ULONG>( SP_GETWHOLEPHRASE ), TRUE, &pwszText, nullptr );
 		if( SUCCEEDED( hr ) )
 		{
@@ -616,6 +616,44 @@ LUA_FUNCTION_STATIC( create )
 	return 1;
 }
 
+static bool insert_attributes( GarrysMod::Lua::ILua *LUA, CComPtr<ISpObjectToken> &token )
+{
+	CComPtr<ISpDataKey> attributesKey;
+	HRESULT hr = token->OpenKey( L"Attributes", &attributesKey );
+	if( FAILED( hr ) )
+		return false;
+
+	LPWSTR wLang = nullptr;
+	hr = attributesKey->GetStringValue( L"Language", &wLang );
+	if( FAILED( hr ) )
+		return false;
+
+	LUA->CreateTable( );
+
+	int &errnoRef = errno;
+	auto beg = wLang;
+	wchar_t *end = nullptr;
+	std::vector<int64_t> languages;
+	for( int64_t k = 0, lang = std::wcstoll( beg, &end, 10 ); beg != end; k++, beg = end, lang = std::wcstoll( beg, &end, 10 ) )
+	{
+		if( errnoRef != 0 )
+			continue;
+
+		LUA->PushNumber( static_cast<double>( k ) );
+		LUA->PushNumber( static_cast<double>( lang ) );
+		LUA->SetTable( -3 );
+
+		if( *end == ';' )
+			++end;
+	}
+
+	LUA->SetField( -2, "languages" );
+
+	::CoTaskMemFree( wLang );
+
+	return true;
+}
+
 LUA_FUNCTION_STATIC( get_recognizers )
 {
 	CComPtr<IEnumSpObjectTokens> recos;
@@ -662,6 +700,8 @@ LUA_FUNCTION_STATIC( get_recognizers )
 
 		LUA->PushString( name.c_str( ) );
 		LUA->SetField( -2, "name" );
+
+		insert_attributes( LUA, token );
 
 		LUA->SetTable( -3 );
 	}
